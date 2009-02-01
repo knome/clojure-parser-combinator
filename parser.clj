@@ -6,9 +6,6 @@
 (defstruct parser-state
   :tokens :ast)
 
-(defn- win [ & args ]
-  (apply struct-map parser-state args))
-
 (defn- per 
   "transform a sequence into a sequence of n-tuples; does not verify length, if not multiple of n returns partial sequence last"
   [ n s ]
@@ -33,14 +30,17 @@
                                            nv)))) ]
     `[ (fn [ ~initial-state-var ]
          (for [ ~@for-statements ]
-           (win :tokens (:tokens ~last-var)
-                :ast    (do ~@ast)))) ]))
+           (struct-map parser-state
+             :tokens (:tokens ~last-var)
+             :ast    (do ~@ast)))) ]))
 
 (defn is-a [ pf ] ; predicate function
   [ (fn [ state ]
-      (when (pf (first (:tokens state)))
-        [ (win :tokens (rest (:tokens state))
-               :ast    (first (:tokens state))) ])) ])
+      (when (and (:tokens state)
+                 (pf (first (:tokens state))))
+        [ (struct-map parser-state
+            :tokens (rest (:tokens state))
+            :ast    (first (:tokens state))) ])) ])
 
 (defn either [ & fns ]
   (reduce concat fns))
@@ -60,9 +60,14 @@
                state       (parser-func token)]
            state)))
 
+(defn run-all [ parser token ]
+  (for [parser-func parser
+        state       (parser-func token)]
+    state))
+
 ;; (repeating :at-least 1 :up-to 10 parse-fn)
 ;; (repeating #(= 5 %))
-;; (repeating :interleaving parse-fn parse-fn) ; interleaved values are not captured , if they are do not use this
+;; (repeating :interleaving parse-fn parse-fn) ; interleaved values are not captured , if they ought to be do not use this
 ;; (repeating :exactly 3 parse-fn)
 ;; (repeating :greedy :less parse-fn)
 ;; the last thing is the list of functions to chain the state into
@@ -71,6 +76,7 @@
 (defmacro repeating [ & opts-then-fnlist ]
   (let [opts (apply hash-map (take (+ -1 (count opts-then-fnlist)) opts-then-fnlist))
         ifns  (last opts-then-fnlist)]
+    ;; may specify either an :exactly count of expected repititions, or both, either or neither of :at-least and :up-to counts
     (assert (or (and (or (:at-least opts)
                          (:up-to    opts))
                      (not (:exactly opts)))
@@ -80,10 +86,12 @@
                 (and (not (or (:at-least opts)
                               (:up-to    opts)
                               (:exactly  opts))))))
+    ;; matches at minimum the specified number of matches
     (assert (or (not (:at-least opts))
                 (not (:up-to    opts))
                 (>= (:up-to opts)
                     (:at-least opts))))
+    ;; the repitition has a :greedy setting of either :more * or :less *?
     (assert (or (not (:greedy opts))
                 (= :more (:greedy opts))
                 (= :less (:greedy opts))))
@@ -97,59 +105,43 @@
                          [~@vars])))
         ; start a surrounding whereas , if there is a minimum put it here with an exact
         ; after that insert a parse-function that will act appropriate to the greediness or lack thereof in the repeats option set
-        (let [vars (take (or (:at-least opts) 0) (repeatedly gensym))
-              rvar (gensym)]
-          `(whereas [~@(reduce concat (let [uiv (map (fn [v#] (list v# ifns)) vars) ]
-                                        (if (:interleaving opts)
-                                          (intersperse (list (gensym) (:interleaving opts)) uiv)
-                                          uiv)))
-                     ~@(when (and (:at-least opts) (:interleaving opts))
-                         (list (gensym) (:interleaving opts)))
-                     ~rvar (either ~(or (and true ; if we are processing repitition , no interleaving , no up-to ; yet
-                                             (= :less (:greedy opts))
-                                             ;; non-greedy
-                                             `[ (fn [ initial-state# ]
-                                                  ((fn depthfully-gathering# [ state# ] 
-                                                     (when-let [deeper-states# (map
-                                                                                (fn [s#]
-                                                                                  {:tokens (:tokens s#) :ast [(:ast s#)]})
-                                                                                (reduce concat (map 
-                                                                                                (fn [ifn#]
-                                                                                                  (ifn# state#))
-                                                                                                ~ifns)))]
-                                                       (map 
-                                                        (fn [s#]
-                                                          {:tokens (:tokens s#)
-                                                           :ast (vec (reduce concat [(:ast state#) (:ast s#)]))})
-                                                        (reduce concat (map 
-                                                                        (fn [s#]
-                                                                          (concat [ s# ] (depthfully-gathering# s#)))
-                                                                        deeper-states#)))))
-                                                   {:tokens (:tokens initial-state#) :ast []}))])
-                                        ;; greedy
-                                        `[ (fn [ initial-state# ]
-                                             ((fn depthfully-gathering# [ state# ] 
-                                                (when-let [deeper-states# (map
-                                                                           (fn [s#]
-                                                                             {:tokens (:tokens s#) :ast [(:ast s#)]})
-                                                                           (reduce concat (map 
-                                                                                           (fn [ifn#]
-                                                                                             (ifn# state#))
-                                                                                           ~ifns)))]
-                                                  (map 
-                                                   (fn [s#]
-                                                     {:tokens (:tokens s#)
-                                                      :ast (vec (reduce concat [(:ast state#) (:ast s#)]))})
-                                                   (reduce concat (map 
-                                                                   (fn [s#]
-                                                                     (concat (depthfully-gathering# s#) [ s# ]))
-                                                           deeper-states#)))))
-                                              {:tokens (:tokens initial-state#) :ast []}))])
-                                   ; this causes nested 0 allowing repeats to overflow
-                                   ; so a symbol representing ran but did nothing will need to be devised
-                                   ; perhaps consumption tracking?
-                                   ; specifically (run (repeating (either (repeating (is-a #(= 1 %))) (is-a #(= 2 %)))) {:tokens [3]})
-                                   ; specifically (run (repeating (either (repeating :at-least 1 (is-a #(= 1 %))) (is-a #(= 2 %)))) {:tokens [1 1 1 2 1 1 2]})
-                                   ; this should not be a problem in most actually grammars
-                                   [ (fn [ s# ] [{:tokens (:tokens s#) :ast nil}])])]
-                    (concat [ ~@vars ] ~rvar ))))))
+        (let [depth-var         (gensym)
+              deeper-values-var (gensym)
+              initial-state-var (gensym)
+              depthfully-gather-var (gensym)]
+          `[ (fn ~depthfully-gather-var
+               ( [ ~initial-state-var ]
+                   (~depthfully-gather-var
+                    {:tokens (:tokens ~initial-state-var) :ast []}
+                    0) )
+               ( [ ~initial-state-var ~depth-var ]
+                   ;; wrap the body in either an if statement checking the current valuation depth or a do depending on need
+                   ( ~@(if (:up-to opts)
+                         `(if (< ~(:up-to opts) ~depth-var) nil)
+                         `(do))
+                     (if-let [~deeper-values-var (map 
+                                                  (fn [s#]
+                                                    {:tokens (:tokens s#)
+                                                     :ast (concat (:ast ~initial-state-var) [ (:ast s#) ])})
+                                                  (reduce concat (map (fn [ifn#] (ifn# ~initial-state-var))
+                                                                      ~(if (:interleaving opts)
+                                                                         `(if (= ~depth-var 0)
+                                                                            ~ifns
+                                                                            (whereas [_# ~(:interleaving opts)
+                                                                                      v# ~ifns ]
+                                                                                     v#))
+                                                                         ifns))))]
+                       (reduce concat
+                               (reduce concat 
+                                       [ ~@(when (= (:greedy opts) :less)
+                                             (if (:at-least opts)
+                                               `((if (> ~(:at-least opts) ~depth-var) [] [ [ [ ~initial-state-var ] ] ]))
+                                               `[ [ [ ~initial-state-var ] ] ]))
+                                         (map (fn [ns#] (~depthfully-gather-var ns# (inc ~depth-var))) ~deeper-values-var) 
+                                         ~@(when (not (= (:greedy opts) :less))
+                                             (if (:at-least opts)
+                                               `((if (> ~(:at-least opts) ~depth-var) [] [ [ [ ~initial-state-var ] ] ]))
+                                               `[ [ [ ~initial-state-var ] ] ])) ]))
+                       ~(if (:at-least opts)
+                          `(if (> ~(:at-least opts) ~depth-var) [] [ ~initial-state-var ])
+                          `[ ~initial-state-var ]))))) ]))))
