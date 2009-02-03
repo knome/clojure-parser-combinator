@@ -50,26 +50,33 @@
       (when (every? apply pfns)
         [state]))])
 
-(defn- intersperse [ v ls ]
-  (lazy-cons
-   (first ls)
-   (reduce concat (map #(list v %) (rest ls)))))
-
-(defn run [ parser token ]
-  (first (for [parser-func parser
-               state       (parser-func token)]
-           state)))
-
-(defn run-all [ parser token ]
+(defn run-all [ parser tokens ]
   (for [parser-func parser
-        state       (parser-func token)]
+        state       (parser-func {:tokens tokens})]
     state))
 
+(defn run [ parser tokens ]
+  (first (run-all parser tokens)))
+
+(defn matches-all? [ parser tokens ]
+  (let [m (run parser tokens)]
+    (and m (not (:tokens m)))))
+
+;; applies the given parser extracting an ast, but leaves the tokens in-place
+(defn peeking [ parser ]
+  [ (fn [ state ]
+      (let [peek-state (and (:tokens state)
+                            (run parser (:tokens state)))]
+        [ (struct-map parser-state
+            :tokens (:tokens state)
+            :ast    (:ast peek-state)) ])) ])
+  
 ;; (repeating :at-least 1 :up-to 10 parse-fn)
 ;; (repeating #(= 5 %))
 ;; (repeating :interleaving parse-fn parse-fn) ; interleaved values are not captured , if they ought to be do not use this
 ;; (repeating :exactly 3 parse-fn)
 ;; (repeating :greedy :less parse-fn)
+;; (repeating :collecting :all parse-fn) ; as opposed to the default of :collecting :first ; that is, either match the most ( or least dependant on greediness ) or nothing, not partials/extensions
 ;; the last thing is the list of functions to chain the state into
 ;; everything upto there is dropped into a hash
 
@@ -100,7 +107,7 @@
              (let [vars (take (:exactly opts) (repeatedly gensym))]
                `(whereas [ ~@(reduce concat (let [uiv (map (fn [v#] (list v# ifns)) vars) ]
                                               (if (:interleaving opts)
-                                                (intersperse (list (gensym) (:interleaving opts)) uiv)
+                                                (interpose (list (gensym) (:interleaving opts)) uiv)
                                                 uiv)))]
                          [~@vars])))
         ; start a surrounding whereas , if there is a minimum put it here with an exact
@@ -111,9 +118,12 @@
               depthfully-gather-var (gensym)]
           `[ (fn ~depthfully-gather-var
                ( [ ~initial-state-var ]
-                   (~depthfully-gather-var
-                    {:tokens (:tokens ~initial-state-var) :ast []}
-                    0) )
+                   ( ~@(if (= (:collecting opts) :all)
+                         `(do)
+                         `((comp list first)))
+                     (~depthfully-gather-var
+                      {:tokens (:tokens ~initial-state-var) :ast []}
+                      0) ))
                ( [ ~initial-state-var ~depth-var ]
                    ;; wrap the body in either an if statement checking the current valuation depth or a do depending on need
                    ( ~@(if (:up-to opts)
